@@ -1,12 +1,12 @@
 /**
  * Copyright 2016 Angus Warren
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,19 +16,115 @@
 
 package anguswarren.confluence;
 
-import org.apache.log4j.Category;
-import java.io.InputStream;
+import org.apache.log4j.Logger;
+import java.io.File;
+import java.io.FileInputStream;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 import java.security.Principal;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import com.atlassian.core.util.ClassLoaderUtils;
-import com.atlassian.confluence.user.ConfluenceAuthenticator;
 
+import com.atlassian.confluence.user.ConfluenceAuthenticator;
+import com.atlassian.confluence.user.ConfluenceUser;
+import com.atlassian.confluence.user.AuthenticatedUserThreadLocal;
+import com.atlassian.spring.container.ContainerManager;
+import com.atlassian.confluence.user.UserAccessor;
+
+@SuppressWarnings("serial")
 public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
-    private static final Category log = Category.getInstance(RemoteUserConfluenceAuth.class);
-	
+    private static final Logger log = Logger.getLogger(RemoteUserConfluenceAuth.class);
+
+    private static final String workDirHint = "CATALINA_HOME"+File.separator;
+    private static final String confPath = "conf"+File.separator;
+    private static final String propsFile = "RemoteUserConfluenceAuth.properties";
+    private static final Properties props = initProps();
+    private static final Properties initProps() {
+        Properties p = new Properties();
+
+        try {
+            p.load(new FileInputStream(new File(confPath+propsFile)));
+            log.debug("Properties loaded from file: "+workDirHint+confPath+propsFile);
+        } catch (java.io.FileNotFoundException e) {
+            log.warn("Optional properties file not found at "+workDirHint+confPath+propsFile);
+        } catch (Exception e) {
+            log.error("Error loading properties file: "+workDirHint+confPath+propsFile + e, e);
+        }
+
+        // Default values...
+        if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "confluence-users");
+        if (p.getProperty("format") == null) p.setProperty("format", "username");
+        if (p.getProperty("header") == null) p.setProperty("header", "REMOTE_USER");
+        if (p.getProperty("trustedhosts") == null) p.setProperty("trustedhosts", "");
+
+        // Sanitise values...
+        if (!p.getProperty("format").equals("email")) p.setProperty("format", "username");
+
+        // Due diligence...
+        p.setProperty("header",p.getProperty("header").toUpperCase());
+        if (!p.getProperty("header").equals("REMOTE_USER") && p.getProperty("trustedhosts").equals("")) {
+            p.setProperty("trustedhosts", "127.0.0.1");
+            log.error(workDirHint+confPath+propsFile+" values would allow insecure HTTP header SSO without any 'trustedhosts'! "+
+                    "Please ensure 'trustedhosts' is configured appropriately (currently defaulting to 127.0.0.1). "+
+                    "If you must use this configuration in a non-production scenario, access the site locally or via an ssh tunnel.");
+        }
+
+        log.info("Runtime properties:");
+        p.forEach((k,v) -> log.info(k+"="+v));
+
+        return p;
+    }
+
+    private ConfluenceUser getAdminUser() {
+        UserAccessor userAccessor = (UserAccessor) ContainerManager.getComponent("userAccessor");
+        List<String> adminUsernames = userAccessor.getMemberNamesAsList(userAccessor.getGroup("confluence-administrators"));
+        if ( adminUsernames != null && !adminUsernames.isEmpty() ) {
+            for ( String username : adminUsernames ) {
+                if ( !userAccessor.isDeactivated(username) ) return userAccessor.getUserByName(username);
+            }
+        }
+        return null;
+    }
+
+    private ConfluenceUser activateUser( String username, String defaultGroups ) {
+        UserAccessor userAccessor = (UserAccessor) ContainerManager.getComponent("userAccessor");
+        if (!userAccessor.exists(username)) {
+            log.warn( "Unable to activate unregistered user: " + username );
+            return null;
+        }
+        log.debug("User account exists: " + username);
+
+        // TODO: Test if user is activated AND in default groups before any privilege escalation,
+        // this would make the method more robust if it can't find an admin account
+
+        ConfluenceUser userManagementAccount = getAdminUser();
+        if ( userManagementAccount != null ) {
+            ConfluenceUser user = userAccessor.getUserByName(username);
+            AuthenticatedUserThreadLocal.set(userManagementAccount);
+            try {
+                if (userAccessor.isDeactivated(username)) {
+                    log.warn("Reactivating user: "+username);
+                    userAccessor.reactivateUser(user);
+                }
+                for (String group: defaultGroups.split(",")) {
+                    group = group.trim();
+                    if (!userAccessor.hasMembership(group, username)) {
+                        log.warn("Adding '"+group+"' group membership to user: " + username);
+                        userAccessor.addMembership(group, username);
+                    }
+                }
+            } finally {
+                AuthenticatedUserThreadLocal.reset();
+            }
+            log.debug("Account confirmed active with default group membership: " + username);
+            return user;
+        } else {
+            log.error("An enabled admin account is required to perform account management operations, no such account could not be found.");
+        }
+        return null;
+    }
+
     public Principal getUser(HttpServletRequest request, HttpServletResponse response) {
         Principal user = null;
         try {
@@ -38,45 +134,41 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
                 String username = user.getName();
                 user = getUser(username);
             } else {
-                Properties p = new Properties();
-                try {
-                    InputStream iStream = ClassLoaderUtils.getResourceAsStream("RemoteUserConfluenceAuth.properties", this.getClass());
-                    p.load(iStream);
-                } catch (Exception e) {
-                    log.debug("Exception loading propertie. The properties file is optional anyway, so this may not be an issues: " + e, e);
+                String trustedhosts = props.getProperty("trustedhosts");
+                String ipAddress = request.getRemoteAddr();
+                if (!Arrays.asList(trustedhosts.split(",")).contains(ipAddress)) {
+                    log.debug("IP not found in trustedhosts: " + ipAddress);
+                    return null;
                 }
 
-                String trustedhosts = p.getProperty("trustedhosts");
-                if (trustedhosts != null) {
-                    String ipAddress = request.getRemoteAddr();
-                    if (Arrays.asList(trustedhosts.split(",")).contains(ipAddress)) {
-                        log.debug("IP found in trustedhosts.");
-                    } else {
-                        log.debug("IP not found in trustedhosts: " + ipAddress);
-                        return null; 
-                    }
-                } else {
-                    log.debug("trustedhosts not configured. If you're using http headers, this may be a security issue.");
-                }
-
-                String remoteuser = null;
-                String header = p.getProperty("header");
-                if (header == null) {
-                    log.debug("Trying REMOTE_USER for SSO");
-                    remoteuser = request.getRemoteUser();
+                String upstreamUser = null;
+                String header = props.getProperty("header");
+                if ( header.equals("REMOTE_USER") ) {
+                    log.debug("Trying REMOTE_USER (AJP) for SSO");
+                    upstreamUser = request.getRemoteUser();
                 } else {
                     log.debug("Trying HTTP header '" + header + "' for SSO");
-                    remoteuser = request.getHeader(header);
+                    upstreamUser = request.getHeader(header);
                 }
 
-                if (remoteuser != null) {
-                    String[] username = remoteuser.split("@");
-                    user = getUser(username[0]);
-                    log.debug("Logging in with username: " + user);
-                    request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY, user);
-                    request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_OUT_KEY, null);
+                if (upstreamUser != null) {
+                    log.debug("Raw upstream user information: "+ upstreamUser);
+                    if ( props.getProperty("format").equals("username") ) {
+                        upstreamUser = upstreamUser.split("@")[0];
+                    }
+                    upstreamUser = upstreamUser.trim();
+                    log.debug("Formatted upstream user information: "+ upstreamUser);
+
+                    user = (Principal) activateUser(upstreamUser, props.getProperty("defaultgroups"));
+                    if ( user != null ) {
+                        log.debug("Logging in with username: " + upstreamUser);
+                        request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY, user);
+                        request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_OUT_KEY, null);
+                    } else {
+                        log.warn("Unable to authorise access attempt: "+ upstreamUser);
+                    }
                 } else {
-                    log.debug("remote_user is null");
+                    log.debug("HTTP header or REMOTE_USER not set (no upstream user session)");
                     return null;
                 }
             }
