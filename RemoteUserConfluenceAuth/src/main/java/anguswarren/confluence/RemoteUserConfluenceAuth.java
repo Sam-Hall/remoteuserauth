@@ -36,7 +36,8 @@ import com.atlassian.confluence.user.UserAccessor;
 public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
     private static final Logger log = Logger.getLogger(RemoteUserConfluenceAuth.class);
 
-    private static final String workDirHint = "CATALINA_HOME"+File.separator;
+    private static final String appDir = System.getProperty("catalina.home")+File.separator;
+    private static final String appDirHint = "CATALINA_HOME"+File.separator;
     private static final String confPath = "conf"+File.separator;
     private static final String propsFile = "RemoteUserConfluenceAuth.properties";
     private static final Properties props = initProps();
@@ -44,16 +45,17 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
         Properties p = new Properties();
 
         try {
-            p.load(new FileInputStream(new File(confPath+propsFile)));
-            log.debug("Properties loaded from file: "+workDirHint+confPath+propsFile);
+            p.load(new FileInputStream(new File(appDir+confPath+propsFile)));
+            log.debug("Properties loaded from file: "+appDirHint+confPath+propsFile);
         } catch (java.io.FileNotFoundException e) {
-            log.warn("Optional properties file not found at "+workDirHint+confPath+propsFile);
+            log.warn("Optional properties file not found at "+appDirHint+confPath+propsFile);
         } catch (Exception e) {
-            log.error("Error loading properties file: "+workDirHint+confPath+propsFile + e, e);
+            log.error("Error loading properties file: "+appDirHint+confPath+propsFile + e, e);
         }
 
         // Default values...
         if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "confluence-users");
+        if (p.getProperty("groupmanagement") == null) p.setProperty("groupmanagement", "optional");
         if (p.getProperty("format") == null) p.setProperty("format", "username");
         if (p.getProperty("header") == null) p.setProperty("header", "REMOTE_USER");
         if (p.getProperty("trustedhosts") == null) p.setProperty("trustedhosts", "");
@@ -65,7 +67,7 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
         p.setProperty("header",p.getProperty("header").toUpperCase());
         if (!p.getProperty("header").equals("REMOTE_USER") && p.getProperty("trustedhosts").equals("")) {
             p.setProperty("trustedhosts", "127.0.0.1");
-            log.error(workDirHint+confPath+propsFile+" values would allow insecure HTTP header SSO without any 'trustedhosts'! "+
+            log.error(appDirHint+confPath+propsFile+" values would allow insecure HTTP header SSO without any 'trustedhosts'! "+
                     "Please ensure 'trustedhosts' is configured appropriately (currently defaulting to 127.0.0.1). "+
                     "If you must use this configuration in a non-production scenario, access the site locally or via an ssh tunnel.");
         }
@@ -76,6 +78,10 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
         return p;
     }
 
+    /**
+     * Returns an active user account from the confluence-administrators group.
+     * @return
+     */
     private ConfluenceUser getAdminUser() {
         UserAccessor userAccessor = (UserAccessor) ContainerManager.getComponent("userAccessor");
         List<String> adminUsernames = userAccessor.getMemberNamesAsList(userAccessor.getGroup("confluence-administrators"));
@@ -87,8 +93,18 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
         return null;
     }
 
-    private ConfluenceUser activateUser( String username, String defaultGroups ) {
+	/**
+	 * Validate the user, ensure they can login according to the current
+	 * "groupmanagement" and "defaultgroups" settings specified via the
+	 * properties file. The method will also attempt to activate the user
+	 * if for whatever reason they may have become deactivated.
+	 * 
+	 * @param username Atlassian username, case sensitive (must be lower-case)
+	 * @return The validated user, confirmed ready for login. Otherwise, null.
+	 */
+    private Principal validateUser( String username ) {
         UserAccessor userAccessor = (UserAccessor) ContainerManager.getComponent("userAccessor");
+        
         if (!userAccessor.exists(username)) {
             log.warn( "Unable to activate unregistered user: " + username );
             return null;
@@ -97,6 +113,9 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
 
         // TODO: Test if user is activated AND in default groups before any privilege escalation,
         // this would make the method more robust if it can't find an admin account
+        // alternatively, figure out how to do the group management without privileges like the Jira implementation
+        
+        // TODO: add groupmanagement features
 
         ConfluenceUser userManagementAccount = getAdminUser();
         if ( userManagementAccount != null ) {
@@ -107,7 +126,7 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
                     log.warn("Reactivating user: "+username);
                     userAccessor.reactivateUser(user);
                 }
-                for (String group: defaultGroups.split(",")) {
+                for (String group: props.getProperty("defaultgroups").split(",")) {
                     group = group.trim();
                     if (!userAccessor.hasMembership(group, username)) {
                         log.warn("Adding '"+group+"' group membership to user: " + username);
@@ -118,7 +137,7 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
                 AuthenticatedUserThreadLocal.reset();
             }
             log.debug("Account confirmed active with default group membership: " + username);
-            return user;
+            return (Principal) user;
         } else {
             log.error("An enabled admin account is required to perform account management operations, no such account could not be found.");
         }
@@ -126,13 +145,13 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
     }
 
     public Principal getUser(HttpServletRequest request, HttpServletResponse response) {
-        Principal user = null;
+        Principal userPrincipal = null;
         try {
             if (request.getSession() != null && request.getSession().getAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY) != null) {
                 log.debug("Session found; user already logged in");
-                user = (Principal) request.getSession().getAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY);
-                String username = user.getName();
-                user = getUser(username);
+                userPrincipal = (Principal) request.getSession().getAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY);
+                String username = userPrincipal.getName();
+                userPrincipal = getUser(username);
             } else {
                 String trustedhosts = props.getProperty("trustedhosts");
                 String ipAddress = request.getRemoteAddr();
@@ -156,13 +175,13 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
                     if ( props.getProperty("format").equals("username") ) {
                         upstreamUser = upstreamUser.split("@")[0];
                     }
-                    upstreamUser = upstreamUser.trim();
+                    upstreamUser = upstreamUser.toLowerCase().trim();
                     log.debug("Formatted upstream user information: "+ upstreamUser);
 
-                    user = (Principal) activateUser(upstreamUser, props.getProperty("defaultgroups"));
-                    if ( user != null ) {
+                    userPrincipal = validateUser(upstreamUser);
+                    if ( userPrincipal != null ) {
                         log.debug("Logging in with username: " + upstreamUser);
-                        request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY, user);
+                        request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY, userPrincipal);
                         request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_OUT_KEY, null);
                     } else {
                         log.warn("Unable to authorise access attempt: "+ upstreamUser);
@@ -175,6 +194,6 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
         } catch (Exception e) {
             log.error("Exception: " + e, e);
         }
-        return user;
+        return userPrincipal;
     }
 }
