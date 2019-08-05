@@ -22,6 +22,9 @@ Build instructions
     ```
 3. Run command `atlas-package` in the RemoteUserConfluenceAuth` directory
 
+Eclipse IDE Integration
+-----------
+To ensure Eclipse is integrated with the Atlassian SDK, go into Preferences | Maven | Installation and add the Atlassian SDK Maven. Also, set Preferences | Maven | User Settings settings.xml to point at the SDK Maven settings.xml. Before importing the project into Eclipse, run `atlas-mvn eclipse:eclipse` in each project directory.
 
 Installation
 -----------

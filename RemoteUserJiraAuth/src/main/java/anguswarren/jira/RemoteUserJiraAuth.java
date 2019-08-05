@@ -32,7 +32,6 @@ import com.atlassian.jira.security.JiraAuthenticationContext;
 import com.atlassian.jira.security.groups.GroupManager;
 import com.atlassian.jira.bc.user.ApplicationUserBuilderImpl;
 import com.atlassian.jira.bc.user.UserService;
-import com.atlassian.jira.bc.user.UserService.UpdateUserValidationResult;
 import com.atlassian.jira.component.ComponentAccessor;
 import com.atlassian.jira.user.ApplicationUser;
 import com.atlassian.jira.user.util.UserManager;
@@ -62,13 +61,16 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
         }
 
         // Default values...
-        if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "jira-users");
+        if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "confluence-users");
+        if (p.getProperty("groupsheader") == null) p.setProperty("groupsheader", "");
         if (p.getProperty("groupmanagement") == null) p.setProperty("groupmanagement", "optional");
         if (p.getProperty("format") == null) p.setProperty("format", "username");
         if (p.getProperty("header") == null) p.setProperty("header", "REMOTE_USER");
         if (p.getProperty("trustedhosts") == null) p.setProperty("trustedhosts", "");
 
         // Sanitise values...
+        //TODO: more effort here? trims and cases, etc. this only runs once after all, validate IP addresses and log errors
+        if (!p.getProperty("groupsheader").equals("")) p.setProperty("defaultgroups", "");
         if (!p.getProperty("format").equals("email")) p.setProperty("format", "username");
 
         // Due diligence...
@@ -102,14 +104,15 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
     
 	/**
 	 * Validate the user, ensure they can login according to the current
-	 * "groupmanagement" and "defaultgroups" settings specified via the
-	 * properties file. The method will also attempt to activate the user
-	 * if for whatever reason they may have become deactivated.
+	 * "groupmanagement" settings when requiredGroups are specified.
+	 * The method will also attempt to activate the user if for whatever
+	 * reason they may have become deactivated.
 	 * 
 	 * @param username Atlassian username, case sensitive (must be lower-case)
+	 * @param requiredGroups Comma separated list of required groups
 	 * @return The validated user, confirmed ready for login. Otherwise, null.
 	 */
-	private Principal validateUser( String username ) {
+	private Principal validateUser( String username, String requiredGroups ) {
     	UserService userService = ComponentAccessor.getComponent( UserService.class );
     	UserManager userManager = ComponentAccessor.getUserManager();
     	ApplicationUser appUser = userManager.getUserByKeyEvenWhenUnknown( username );
@@ -120,29 +123,29 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
         }
         log.debug("User account exists: " + username);
         
-        if ( !props.getProperty("groupmanagement").contentEquals("optional") ) {
+        if ( !requiredGroups.equals("") ) {
             UserUtil userUtil = ComponentAccessor.getUserUtil();
             GroupManager groupManager = ComponentAccessor.getGroupManager();
             
             SortedSet<String> groups = userUtil.getGroupNamesForUser(username);
-            for (String defaultGroup: props.getProperty("defaultgroups").split(",")) {
-            	defaultGroup = defaultGroup.trim();
-                if (!groups.contains(defaultGroup)) {
-                	log.debug("User missing '"+defaultGroup+"' group membership: " + username);
+            for (String requiredGroup: requiredGroups.split(",")) {
+            	requiredGroup = requiredGroup.toLowerCase().trim();
+                if (!groups.contains(requiredGroup)) {
+                	log.debug("User missing '"+requiredGroup+"' group membership: " + username);
                 	if (props.getProperty("groupmanagement").contentEquals("required")) {
-                		log.warn("Unable to authorise access attempt as user is missing required '"+defaultGroup+"' group membership: "+ username);
+                		log.warn("Unable to authorise access attempt as user is missing required '"+requiredGroup+"' group membership: "+ username);
                 		return null;
                 	} else if (props.getProperty("groupmanagement").contentEquals("autojoin")) {
-                		log.warn("Adding '"+defaultGroup+"' group membership to user: " + username);
+                		log.warn("Adding '"+requiredGroup+"' group membership to user: " + username);
                 		try {
-                    		groupManager.addUserToGroup( appUser, groupManager.getGroup( defaultGroup ) );
+                    		groupManager.addUserToGroup( appUser, groupManager.getGroup( requiredGroup ) );
                 		} catch (Exception e) {
-                			log.error("Failed to add '"+defaultGroup+"' group membership: "+ e, e);
+                			log.error("Failed to add '"+requiredGroup+"' group membership: "+ e, e);
                     		return null;
                 		}
                 	}
                 } else {
-                    log.debug("User has '"+defaultGroup+"' group membership: " + username);
+                    log.debug("User has '"+requiredGroup+"' group membership: " + username);
                 }
             }
         }
@@ -155,7 +158,7 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
             	try {
                 	jiraAuthenticationContext.setLoggedInUser(userManagementAccount);
 	                ApplicationUser updateUser = (new ApplicationUserBuilderImpl(appUser)).active(true).build();
-	                UpdateUserValidationResult updateUserValidationResult = userService.validateUpdateUser(updateUser);
+	                UserService.UpdateUserValidationResult updateUserValidationResult = userService.validateUpdateUser(updateUser);
 	        	    if (updateUserValidationResult.isValid()) {
 	    	            userService.updateUser(updateUserValidationResult);
 	    	            log.warn("Reactivativated user account: " + username);
@@ -171,8 +174,28 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
                 return null;
         	}
         }
-        log.debug("User account validated: " + username);
+        log.debug("Account confirmed active with required group membership: " + username);
     	return (Principal) appUser;
+    }
+	
+    /**
+     * Returns require groups string based on the properties.
+     * 
+     * @return 
+     */
+    private String getRequiredGroups( HttpServletRequest request ) {
+    	String requiredGroups;
+    	if ( props.getProperty("groupmanagement").contentEquals("optional") ) {
+    		return "";
+    	}
+    	if ( props.getProperty("groupsheader").contentEquals("") ) {
+    		requiredGroups = props.getProperty("defaultgroups");
+    	} else {
+    		requiredGroups = request.getHeader(props.getProperty("groupsheader"));
+    	}
+    	if ( requiredGroups == null ) requiredGroups = "";
+    	log.debug("Required group list: " + requiredGroups);
+    	return requiredGroups;
     }
 
     public Principal getUser(HttpServletRequest request, HttpServletResponse response) {
@@ -209,7 +232,7 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
                     upstreamUser = upstreamUser.toLowerCase().trim();
                     log.debug("Formatted upstream user information: "+ upstreamUser);
 
-                    userPrincipal = validateUser( upstreamUser );
+                    userPrincipal = validateUser( upstreamUser, getRequiredGroups(request) );
                     if ( userPrincipal != null ) {
                         log.debug("Logging in with username: " + upstreamUser);
                         request.getSession().setAttribute(JiraSeraphAuthenticator.LOGGED_IN_KEY, userPrincipal);

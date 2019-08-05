@@ -55,12 +55,15 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
 
         // Default values...
         if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "confluence-users");
+        if (p.getProperty("groupsheader") == null) p.setProperty("groupsheader", "");
         if (p.getProperty("groupmanagement") == null) p.setProperty("groupmanagement", "optional");
         if (p.getProperty("format") == null) p.setProperty("format", "username");
         if (p.getProperty("header") == null) p.setProperty("header", "REMOTE_USER");
         if (p.getProperty("trustedhosts") == null) p.setProperty("trustedhosts", "");
 
         // Sanitise values...
+        //TODO: more effort here? trims and cases, etc. this only runs once after all, validate IP addresses and log errors
+        if (!p.getProperty("groupsheader").equals("")) p.setProperty("defaultgroups", "");
         if (!p.getProperty("format").equals("email")) p.setProperty("format", "username");
 
         // Due diligence...
@@ -95,14 +98,15 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
 
 	/**
 	 * Validate the user, ensure they can login according to the current
-	 * "groupmanagement" and "defaultgroups" settings specified via the
-	 * properties file. The method will also attempt to activate the user
-	 * if for whatever reason they may have become deactivated.
+	 * "groupmanagement" settings when requiredGroups are specified.
+	 * The method will also attempt to activate the user if for whatever
+	 * reason they may have become deactivated.
 	 * 
 	 * @param username Atlassian username, case sensitive (must be lower-case)
+	 * @param requiredGroups Comma separated list of required groups
 	 * @return The validated user, confirmed ready for login. Otherwise, null.
 	 */
-    private Principal validateUser( String username ) {
+    private Principal validateUser( String username, String requiredGroups ) {
         UserAccessor userAccessor = (UserAccessor) ContainerManager.getComponent("userAccessor");
         
         if (!userAccessor.exists(username)) {
@@ -110,40 +114,78 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
             return null;
         }
         log.debug("User account exists: " + username);
-
-        // TODO: Test if user is activated AND in default groups before any privilege escalation,
-        // this would make the method more robust if it can't find an admin account
-        // alternatively, figure out how to do the group management without privileges like the Jira implementation
         
-        // TODO: add groupmanagement features
-
-        ConfluenceUser userManagementAccount = getAdminUser();
-        if ( userManagementAccount != null ) {
-            ConfluenceUser user = userAccessor.getUserByName(username);
-            AuthenticatedUserThreadLocal.set(userManagementAccount);
-            try {
-                if (userAccessor.isDeactivated(username)) {
-                    log.warn("Reactivating user: "+username);
-                    userAccessor.reactivateUser(user);
+        if ( !requiredGroups.equals("") ) {
+            for (String requiredGroup: requiredGroups.split(",")) {
+            	requiredGroup = requiredGroup.toLowerCase().trim();
+                if (!userAccessor.hasMembership(requiredGroup, username)) {
+                	log.debug("User missing '"+requiredGroup+"' group membership: " + username);
+                	if (props.getProperty("groupmanagement").contentEquals("required")) {
+                		log.warn("Unable to authorise access attempt as user is missing required '"+requiredGroup+"' group membership: "+ username);
+                		return null;
+                	} else if (props.getProperty("groupmanagement").contentEquals("autojoin")) {
+                		log.warn("Adding '"+requiredGroup+"' group membership to user: " + username);
+                		ConfluenceUser userManagementAccount = getAdminUser();
+                		if ( userManagementAccount != null ) {
+                    		AuthenticatedUserThreadLocal.set(userManagementAccount);
+                            try {
+                                userAccessor.addMembership(requiredGroup, username);
+                            } finally {
+                                AuthenticatedUserThreadLocal.reset();
+                            }
+                		} else {
+                			log.error("An enabled admin account is required to perform account management operations, no such account could not be found.");
+                			return null;
+                		}
+                	}
+                } else {
+                    log.debug("User has '"+requiredGroup+"' group membership: " + username);
                 }
-                for (String group: props.getProperty("defaultgroups").split(",")) {
-                    group = group.trim();
-                    if (!userAccessor.hasMembership(group, username)) {
-                        log.warn("Adding '"+group+"' group membership to user: " + username);
-                        userAccessor.addMembership(group, username);
-                    }
-                }
-            } finally {
-                AuthenticatedUserThreadLocal.reset();
             }
-            log.debug("Account confirmed active with default group membership: " + username);
-            return (Principal) user;
-        } else {
-            log.error("An enabled admin account is required to perform account management operations, no such account could not be found.");
         }
-        return null;
-    }
+        
+        ConfluenceUser user = userAccessor.getUserByName(username);
+        if (userAccessor.isDeactivated(user)) {
+        	log.debug("Atempting to reactivate inactive user account: " + username);
+        	ConfluenceUser userManagementAccount = getAdminUser();
+        	if ( userManagementAccount != null ) {
+                AuthenticatedUserThreadLocal.set(userManagementAccount);
+                try {
+                    log.warn("Reactivating user account: "+username);
+                    userAccessor.reactivateUser(user);
+                } finally {
+                    AuthenticatedUserThreadLocal.reset();
+                }
+        	} else {
+    			log.error("An enabled admin account is required to perform account management operations, no such account could not be found.");
+    			return null;
+        	}
+        }
 
+        log.debug("Account confirmed active with required group membership: " + username);
+        return (Principal) user;
+    }
+    
+    /**
+     * Returns require groups string based on the properties.
+     * 
+     * @return 
+     */
+    private String getRequiredGroups( HttpServletRequest request ) {
+    	String requiredGroups;
+    	if ( props.getProperty("groupmanagement").contentEquals("optional") ) {
+    		return "";
+    	}
+    	if ( props.getProperty("groupsheader").contentEquals("") ) {
+    		requiredGroups = props.getProperty("defaultgroups");
+    	} else {
+    		requiredGroups = request.getHeader(props.getProperty("groupsheader"));
+    	}
+    	if ( requiredGroups == null ) requiredGroups = "";
+    	log.debug("Required group list: " + requiredGroups);
+    	return requiredGroups;
+    }
+    
     public Principal getUser(HttpServletRequest request, HttpServletResponse response) {
         Principal userPrincipal = null;
         try {
@@ -178,7 +220,7 @@ public class RemoteUserConfluenceAuth extends ConfluenceAuthenticator {
                     upstreamUser = upstreamUser.toLowerCase().trim();
                     log.debug("Formatted upstream user information: "+ upstreamUser);
 
-                    userPrincipal = validateUser(upstreamUser);
+                    userPrincipal = validateUser( upstreamUser, getRequiredGroups(request) );
                     if ( userPrincipal != null ) {
                         log.debug("Logging in with username: " + upstreamUser);
                         request.getSession().setAttribute(ConfluenceAuthenticator.LOGGED_IN_KEY, userPrincipal);
