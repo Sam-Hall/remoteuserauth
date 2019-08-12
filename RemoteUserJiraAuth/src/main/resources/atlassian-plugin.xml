@@ -1,7 +1,7 @@
-<atlassian-plugin key="${project.groupId}.${project.artifactId}" name="${project.name}" plugins-version="1">
+<atlassian-plugin key="anguswarren.confluence.RemoteUserJiraAuth" name="RemoteUserJiraAuth" plugins-version="1">
     <plugin-info>
-        <description>${project.description}</description>
-        <version>${project.version}</version>
-        <vendor name="${project.organization.name}" url="${project.organization.url}" />
+        <description>This is a custom Seraph filter developed by Angus Warren to authenticate based on the remote_user variable set by Apache</description>
+        <version>2.0</version>
+        <vendor name="Angus Warren" url="https://github.com/AngusWarren/remoteuserauth" />
     </plugin-info>
 </atlassian-plugin>
