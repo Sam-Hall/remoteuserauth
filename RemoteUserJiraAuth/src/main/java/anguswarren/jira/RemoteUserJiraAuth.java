@@ -62,7 +62,7 @@ public class RemoteUserJiraAuth extends JiraSeraphAuthenticator {
         }
 
         // Default values...
-        if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "confluence-users");
+        if (p.getProperty("defaultgroups") == null) p.setProperty("defaultgroups", "jira-users");
         if (p.getProperty("groupsheader") == null) p.setProperty("groupsheader", "");
         if (p.getProperty("groupmanagement") == null) p.setProperty("groupmanagement", "optional");
         if (p.getProperty("format") == null) p.setProperty("format", "username");
